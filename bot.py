@@ -10,7 +10,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 BOT_TOKENS = [
-    # Isi bot token Bot 2 di sini
+    "8986671937:AAEJx99dTwlQufqiQebSx0IFLcDej5reTJM",
 ]
 
 API_ID = int(os.environ.get("API_ID", 0))
