@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO)
 
 DB_PATH = "/data/watchlist.db"
 
-WAIT_PHONE, WAIT_CODE, WAIT_PASSWORD = range(3)
+WAIT_PHONE, WAIT_CODE, WAIT_PASSWORD, WAIT_PESAN = range(4)
 
 pending_clients = {}
 
@@ -50,6 +50,12 @@ def init_db():
         CREATE TABLE IF NOT EXISTS user_sessions (
             chat_id INTEGER PRIMARY KEY,
             session_string TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS user_pesan (
+            chat_id INTEGER PRIMARY KEY,
+            pesan TEXT
         )
     """)
 
@@ -131,14 +137,6 @@ def db_autokeep_all():
     conn.close()
     return rows
 
-def db_autokeep_exists(chat_id, username):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM autokeep WHERE chat_id = ? AND username = ?", (chat_id, username))
-    result = c.fetchone()
-    conn.close()
-    return result is not None
-
 def db_save_session(chat_id, session_string):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -158,6 +156,28 @@ def db_delete_session(chat_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("DELETE FROM user_sessions WHERE chat_id = ?", (chat_id,))
+    conn.commit()
+    conn.close()
+
+def db_save_pesan(chat_id, pesan):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO user_pesan (chat_id, pesan) VALUES (?, ?)", (chat_id, pesan))
+    conn.commit()
+    conn.close()
+
+def db_get_pesan(chat_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT pesan FROM user_pesan WHERE chat_id = ?", (chat_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def db_delete_pesan(chat_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM user_pesan WHERE chat_id = ?", (chat_id,))
     conn.commit()
     conn.close()
 
@@ -222,6 +242,16 @@ async def do_autokeep(username: str, session_string: str) -> bool:
         logging.error(f"Autokeep gagal untuk @{username}: {e}")
         return False
 
+async def send_pesan_to_channel(username: str, pesan: str, session_string: str) -> bool:
+    try:
+        async with TelegramClient(StringSession(session_string), API_ID, API_HASH) as client:
+            await client.send_message(f"@{username}", pesan)
+            logging.info(f"Pesan berhasil dikirim ke @{username}")
+            return True
+    except Exception as e:
+        logging.error(f"Gagal kirim pesan ke @{username}: {e}")
+        return False
+
 
 # ===================== LOGIN CONVERSATION =====================
 
@@ -281,8 +311,13 @@ async def login_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await client.disconnect()
         db_save_session(chat_id, session_string)
         pending_clients.pop(chat_id, None)
-        await update.message.reply_text("✅ Login berhasil! Autokeep sekarang akan menggunakan akunmu.")
-        return ConversationHandler.END
+        await update.message.reply_text(
+            "✅ Login berhasil!\n\n"
+            "📝 Mau tambahkan pesan yang akan dikirim ke channel setiap kali autokeep berhasil?\n"
+            "Kirim pesannya sekarang, atau /skip untuk lewati.",
+            parse_mode="Markdown"
+        )
+        return WAIT_PESAN
     except Exception as e:
         error_str = str(e)
         if "two-steps" in error_str.lower() or "password" in error_str.lower():
@@ -310,13 +345,37 @@ async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await client.disconnect()
         db_save_session(chat_id, session_string)
         pending_clients.pop(chat_id, None)
-        await update.message.reply_text("✅ Login berhasil! Autokeep sekarang akan menggunakan akunmu.")
-        return ConversationHandler.END
+        await update.message.reply_text(
+            "✅ Login berhasil!\n\n"
+            "📝 Mau tambahkan pesan yang akan dikirim ke channel setiap kali autokeep berhasil?\n"
+            "Kirim pesannya sekarang, atau /skip untuk lewati.",
+            parse_mode="Markdown"
+        )
+        return WAIT_PESAN
     except Exception as e:
         await client.disconnect()
         pending_clients.pop(chat_id, None)
         await update.message.reply_text(f"⚠️ Password salah atau login gagal: {e}")
         return ConversationHandler.END
+
+async def login_pesan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    pesan = update.message.text.strip()
+    db_save_pesan(chat_id, pesan)
+    await update.message.reply_text(
+        "✅ Pesan berhasil disimpan! Akan dikirim ke channel setiap kali autokeep berhasil.\n\n"
+        "Gunakan /setpesan untuk mengubah, /lihatpesan untuk melihat, atau /hapuspesan untuk menghapus.",
+        parse_mode="Markdown"
+    )
+    return ConversationHandler.END
+
+async def skip_pesan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "✅ Dilewati. Autokeep akan berjalan tanpa mengirim pesan ke channel.\n\n"
+        "Gunakan /setpesan kapan saja untuk menambahkan pesan.",
+        parse_mode="Markdown"
+    )
+    return ConversationHandler.END
 
 async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -330,6 +389,49 @@ async def cancel_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await data["client"].disconnect()
     await update.message.reply_text("❌ Login dibatalkan.")
     return ConversationHandler.END
+
+
+# ===================== PESAN COMMANDS =====================
+
+async def cmd_setpesan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    session = db_get_session(chat_id)
+    if not session:
+        await update.message.reply_text("⚠️ Kamu belum login. Gunakan /login dulu.", parse_mode="Markdown")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Contoh: `/setpesan Halo! Channel ini baru di-keep 🎉`",
+            parse_mode="Markdown"
+        )
+        return
+
+    pesan = " ".join(context.args)
+    db_save_pesan(chat_id, pesan)
+    await update.message.reply_text(
+        f"✅ Pesan berhasil diperbarui:\n\n{pesan}",
+        parse_mode="Markdown"
+    )
+
+async def cmd_lihatpesan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    pesan = db_get_pesan(chat_id)
+    if not pesan:
+        await update.message.reply_text(
+            "📭 Belum ada pesan yang disimpan.\nGunakan /setpesan untuk menambahkan.",
+            parse_mode="Markdown"
+        )
+        return
+    await update.message.reply_text(
+        f"📝 *Pesan aktif kamu:*\n\n{pesan}",
+        parse_mode="Markdown"
+    )
+
+async def cmd_hapuspesan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    db_delete_pesan(chat_id)
+    await update.message.reply_text("🗑 Pesan berhasil dihapus. Autokeep akan berjalan tanpa mengirim pesan.")
 
 
 # ===================== COMMAND HANDLERS =====================
@@ -441,7 +543,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/autokeep @fikar` — aktifkan autokeep untuk username\n"
         "`/unautokeep @fikar` — nonaktifkan autokeep\n"
         "`/autokeeplist` — lihat username yang di-autokeep\n"
-        "Bot otomatis assign username ke akunmu begitu tersedia! 🤖"
+        "Bot otomatis assign username ke akunmu begitu tersedia! 🤖\n\n"
+        "*Pesan Channel:*\n"
+        "`/setpesan <pesan>` — set pesan yang dikirim ke channel setelah di-keep\n"
+        "`/lihatpesan` — lihat pesan aktif\n"
+        "`/hapuspesan` — hapus pesan"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -479,10 +585,17 @@ async def watch_loop(bots: list):
                             success = False
 
                         if success:
+                            pesan = db_get_pesan(chat_id)
+                            if pesan and session:
+                                await send_pesan_to_channel(username, pesan, session)
+
                             notif = (
                                 f"🤖 *Autokeep Berhasil!*\n\n"
                                 f"@{username} berhasil di-assign ke akunmu!"
                             )
+                            if pesan:
+                                notif += f"\n📝 Pesan juga sudah dikirim ke channel."
+
                             db_autokeep_remove(chat_id, username)
                             db_unsave(chat_id, username, bot_token)
                         else:
@@ -530,6 +643,9 @@ async def run_bot(token):
         BotCommand("autokeep", "Aktifkan autokeep username"),
         BotCommand("unautokeep", "Nonaktifkan autokeep username"),
         BotCommand("autokeeplist", "Lihat username yang di-autokeep"),
+        BotCommand("setpesan", "Set pesan yang dikirim ke channel setelah di-keep"),
+        BotCommand("lihatpesan", "Lihat pesan aktif"),
+        BotCommand("hapuspesan", "Hapus pesan channel"),
         BotCommand("help", "Cara penggunaan bot"),
     ])
 
@@ -539,6 +655,10 @@ async def run_bot(token):
             WAIT_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_phone)],
             WAIT_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_code)],
             WAIT_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_password)],
+            WAIT_PESAN: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, login_pesan),
+                CommandHandler("skip", skip_pesan),
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel_login)],
     )
@@ -551,6 +671,9 @@ async def run_bot(token):
     app.add_handler(CommandHandler("autokeep", cmd_autokeep))
     app.add_handler(CommandHandler("unautokeep", cmd_unautokeep))
     app.add_handler(CommandHandler("autokeeplist", cmd_autokeeplist))
+    app.add_handler(CommandHandler("setpesan", cmd_setpesan))
+    app.add_handler(CommandHandler("lihatpesan", cmd_lihatpesan))
+    app.add_handler(CommandHandler("hapuspesan", cmd_hapuspesan))
     app.add_handler(CommandHandler("help", cmd_help))
 
     await app.initialize()
