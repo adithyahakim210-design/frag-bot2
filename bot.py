@@ -13,6 +13,7 @@ BOT_TOKENS = [
     "8986671937:AAEJx99dTwlQufqiQebSx0IFLcDej5reTJM",
     "8927121385:AAFWrezVpbRAs8jP4DsFjwJcOxOfsg-Kybo",
     "8893426039:AAHTwPn6spN4UZgq9p605zv4afXXh97WmMc",
+    "8595642894:AAG70qxP5M1YSS4--vKxyNU1eSUUiERO69Y",
 ]
 
 API_ID = int(os.environ.get("API_ID", 0))
